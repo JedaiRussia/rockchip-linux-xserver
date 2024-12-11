@@ -155,8 +155,272 @@ static const OptionInfoRec Options[] = {
     {OPTION_WARM_UP, "WarmUp", OPTV_BOOLEAN, {0}, FALSE},
     {OPTION_VIRTUAL_SIZE, "VirtualSize", OPTV_STRING, {0}, FALSE},
     {OPTION_PADDING, "Padding", OPTV_STRING, {0}, FALSE},
+    {OPTION_SPLASH, "Splash", OPTV_STRING, {0}, FALSE},
     {-1, NULL, OPTV_NONE, {0}, FALSE}
 };
+
+typedef struct __attribute__((packed))
+{
+    char        bfType[2];
+    uint32_t    bfSize;
+    uint16_t    bfReserved1;
+    uint16_t    bfReserved2;
+    uint32_t    bfOffBits;
+
+    uint32_t    biSize;
+    uint32_t    biWidth;
+    uint32_t    biHeight;
+    uint16_t    biPlanes;
+    uint16_t    biBitCount;
+    uint32_t    biCompression;
+    uint32_t    biSizeImage;
+    uint32_t    biXPelsPerMeter;
+    uint32_t    biYPelsPerMeter;
+    uint32_t    biClrUsed;
+    uint32_t    biClrImportant;
+    uint8_t     bmiColors[256 * 4];
+} WBMP_HEADER;
+
+static uint32_t palette[256];
+
+#define BMP_COL_CONV(r, g, b)    ((r) | (g) << 8 | (b) << 16 | 0xff << 24)
+
+#define INFO_MSG(fmt, ...) \
+        do { xf86DrvMsg(pScrn->scrnIndex, X_INFO, fmt "\n",\
+                ##__VA_ARGS__); } while (0)
+#define ERROR_MSG(fmt, ...) \
+        do { xf86DrvMsg(pScrn->scrnIndex, \
+                X_ERROR, "ERROR: " fmt "\n",\
+                ##__VA_ARGS__); \
+        } while (0)
+
+uint32_t *splashimg;
+int splash_width;
+int splash_height;
+
+static void
+drmmode_copy_splash(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
+{
+#ifdef GLAMOR_HAS_GBM
+    if(splashimg) {
+        ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+        PixmapPtr src, dst;
+        GCPtr gc;
+        int x, y;
+
+        src = (*pScreen->CreatePixmap)(pScreen, 0, 0, 32, 0);
+        if (src) {
+			if (splash_width < pScrn->virtualX || splash_height < pScrn->virtualY) {
+				x = (pScrn->virtualX - splash_width) / 2;
+				y = (pScrn->virtualY - splash_height) / 2;
+			} else {
+				x = 0;
+				y = 0;
+			}
+            if ((*pScreen->ModifyPixmapHeader)(src, splash_width, splash_height, 32,
+                                               32, splash_width * 4, splashimg)) {
+                dst = pScreen->GetScreenPixmap(pScreen);
+
+                gc = GetScratchGC(pScrn->depth, pScreen);
+                ValidateGC(&dst->drawable, gc);
+
+                (*gc->ops->CopyArea)(&src->drawable, &dst->drawable, gc, 0, 0,
+                                     pScrn->virtualX, pScrn->virtualY, x, y);
+
+                FreeScratchGC(gc);
+
+                glamor_finish(pScreen);
+
+                pScreen->canDoBGNoneRoot = TRUE;
+
+                if (drmmode->fbcon_pixmap)
+                    pScrn->pScreen->DestroyPixmap(drmmode->fbcon_pixmap);
+                drmmode->fbcon_pixmap = NULL;
+            }
+            (*pScreen->DestroyPixmap)(src);
+        }
+        free(splashimg);
+    }
+#endif
+}
+
+static Bool show_splash(ScrnInfoPtr pScrn, const char *splash)
+{
+    uint32_t src_pitch;
+    int src_pixman_stride;
+    int dst_pixman_stride;
+    int dst_width, dst_height, dst_bpp, dst_pitch;
+    unsigned char *dst = NULL;
+    int fd = -1;
+    int width, height;
+    pixman_bool_t pixman_ret;
+    Bool ret = FALSE;
+    WBMP_HEADER *hdr = NULL;
+    uint8_t *line = NULL;
+    int a, x, y, pad;
+    uint32_t colors;
+    modesettingPtr ms = modesettingPTR(pScrn);
+
+    if(!ms->drmmode.gbm) {
+        dst = drmmode_map_front_bo(&ms->drmmode);
+        if (!dst) {
+            ERROR_MSG("Couldn't map scanout bo");
+            goto exit;
+        }
+    }
+
+    fd = open(splash, O_RDONLY | O_SYNC);
+    if (fd == -1) {
+        ERROR_MSG("Couldn't open %s", splash);
+        goto exit;
+    }
+
+    hdr = malloc(sizeof(WBMP_HEADER));
+    if (!hdr) {
+        ERROR_MSG("Couldn't alloc hdr buffer");
+        goto exit;
+    }
+
+    if (read(fd, hdr, sizeof(WBMP_HEADER)) != sizeof(WBMP_HEADER)) {
+        ERROR_MSG("BMP header is too short");
+        goto exit;
+    }
+
+    if ((hdr->bfType[0] == 'B') && (hdr->bfType[1] == 'M') &&
+        (hdr->biCompression == 0)) {
+
+        splashimg = malloc(hdr->biWidth * hdr->biHeight * sizeof(uint32_t));
+        if (!splashimg) {
+            ERROR_MSG("Couldn't alloc img buffer");
+            goto exit;
+        }
+        width = hdr->biWidth;
+        height = hdr->biHeight;
+        lseek(fd, hdr->bfOffBits, SEEK_SET);
+        switch(hdr->biBitCount)
+        {
+            case 24:
+                INFO_MSG("BMP: 24bpp");
+                pad = ((width * 3 - 1) ^ 3) & 3;
+                line = malloc(width * 3 + pad);
+                if (!line) {
+                    ERROR_MSG("Couldn't alloc line buffer");
+                    goto exit;
+                }
+                INFO_MSG("BMP: rendering");
+                for(y = height - 1; y >= 0; y--)
+                {
+                    read(fd, line, width * 3 + pad);
+                    for(x = 0; x < width; x++)
+                    {
+                        splashimg[y * width + x] = BMP_COL_CONV(
+                            line[x * 3 + 0],
+                            line[x * 3 + 1],
+                            line[x * 3 + 2]);
+                    }
+                }
+                break;
+
+            case 8:
+                INFO_MSG("BMP: 8bpp");
+                pad = ((width - 1) ^ 3) & 3;
+                line = malloc(width + pad);
+                if (!line) {
+                    ERROR_MSG("Couldn't alloc line buffer");
+                    goto exit;
+                }
+                colors = hdr->biClrUsed ? hdr->biClrUsed :
+                    (hdr->bfOffBits - offsetof(WBMP_HEADER, bmiColors)) / 4;
+                INFO_MSG("BMP: colors = %d", colors);
+                for(a = 0; a < colors; a++)
+                {
+                    palette[a] = BMP_COL_CONV(hdr->bmiColors[a * 4 + 0],
+                        hdr->bmiColors[a * 4 + 1], hdr->bmiColors[a * 4 + 2]);
+                }
+                INFO_MSG("BMP: rendering");
+                for(y = height - 1; y >= 0; y--)
+                {
+                    read(fd, line, width + pad);
+                    for(x = 0; x < width; x++)
+                        splashimg[y * width + x] = palette[line[x]];
+                }
+                break;
+
+            default:
+                ERROR_MSG("Unsupported bpp value");
+                goto exit;
+        }
+        INFO_MSG("BMP: done");
+    } else {
+        ERROR_MSG("BMP file format error");
+        goto exit;
+    }
+
+    if(!ms->drmmode.gbm) {
+        src_pitch = width * sizeof(uint32_t);
+
+        dst_width = ms->drmmode.front_bo.width;
+        dst_height = ms->drmmode.front_bo.height;
+        dst_bpp = ms->drmmode.kbpp;
+        dst_pitch = dst_width * dst_bpp / 8;
+
+        if (width < dst_width || height < dst_height) {
+			x = (dst_width - width) / 2;
+			y = (dst_height - height) / 2;
+		} else {
+			x = 0;
+			y = 0;
+			width = dst_width;
+			height = dst_height;
+		}
+
+        /* The stride parameters pixman takes are in multiples of uint32_t,
+         * which is the data type of the pointer passed */
+        src_pixman_stride = src_pitch / sizeof(uint32_t);
+        dst_pixman_stride = dst_pitch / sizeof(uint32_t);
+
+        /* We could handle the cases where stride is not a multiple of uint32_t,
+         * but they will be rare so not currently worth the added complexity */
+        if (src_pitch % sizeof(uint32_t) || dst_pitch % sizeof(uint32_t)) {
+            ERROR_MSG("Buffer strides need to be a multiple of 4 bytes");
+            goto exit;
+        }
+
+        /* NB: We have to call pixman direct instead of wrapping the buffers as
+         * Pixmaps as this function is called from ScreenInit. Pixmaps cannot be
+         * created until X calls CreateScratchPixmapsForScreen(), and the screen
+         * pixmap is not initialized until X calls CreateScreenResources */
+        pixman_ret = pixman_blt((uint32_t *)splashimg, (uint32_t *)dst,
+                src_pixman_stride, dst_pixman_stride,
+                dst_bpp, dst_bpp, 0, 0,
+                x, y, width, height);
+        if (!pixman_ret) {
+            ERROR_MSG("Pixman failed to blit from %s to scanout buffer",
+                    splash);
+            goto exit;
+        }
+    } else {
+		splash_width = width;
+		splash_height = height;
+	}
+
+    ret = TRUE;
+
+exit:
+    if (line)
+        free(line);
+
+    if (splashimg && !ms->drmmode.gbm)
+        free(splashimg);
+
+    if (hdr)
+        free(hdr);
+
+    if (fd >= 0)
+        close(fd);
+
+    return ret;
+}
 
 int ms_entity_index = -1;
 
@@ -1685,8 +1949,11 @@ CreateWindow_oneshot(WindowPtr pWin)
     pScreen->CreateWindow = ms->CreateWindow;
     ret = pScreen->CreateWindow(pWin);
 
-    if (ret)
-        drmmode_copy_fb(pScrn, &ms->drmmode);
+    if (ret) {
+        /*drmmode_copy_fb(pScrn, &ms->drmmode);*/
+        drmmode_copy_splash(pScrn, &ms->drmmode);
+        INFO_MSG("drmmode_copy_fb()");
+    }
     return ret;
 }
 
@@ -1697,6 +1964,7 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
     modesettingPtr ms = modesettingPTR(pScrn);
     VisualPtr visual;
     const char *str_value;
+    const char *splash;
 
     pScrn->pScreen = pScreen;
 
@@ -1788,6 +2056,14 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
         try_enable_exa(pScrn);
 
     xf86SetBackingStore(pScreen);
+    splash = xf86GetOptValString(ms->drmmode.Options, OPTION_SPLASH);
+    if (splash && *splash != '\0') {
+        if (show_splash(pScrn, splash)) {
+            /* Only allow None BG root if we initialized the scanout
+             * buffer */
+            pScreen->canDoBGNoneRoot = TRUE;
+        }
+    }
     xf86SetSilkenMouse(pScreen);
     miDCInitialize(pScreen, xf86GetPointerScreenFuncs());
 
